@@ -1,0 +1,141 @@
+To: yury@pulsesensor.com
+Subject: Hackster tutorial draft: StickS3 -> BLE -> Chrome 3D FFT (repo pushed, ready for corp posting)
+
+--------------------------------------------------------------------
+
+Repo is public and pushed: https://github.com/yury-g/StickS3-BLE-Chrome-3D-FFT
+
+Per your instructions, I didn't fill out anything on Hackster.io directly. Below is the full tutorial text, written to match Hackster's project editor fields and content guidelines (hackster.io/guidelines) and Alex Wulff's structure guide, so it can be copied field-by-field when the corp account posts it. The code and README live in the repo; this email is the text-only draft.
+
+One prep note before posting: per Hackster's guidelines, code should go into their Code/Attachments section as proper snippets, not pasted as plain text in the Story -- the two code blocks below are marked where they'd go (sticks3-relay.py and index.html, both in the repo).
+
+==============================
+NAME (required -- complete sentence, descriptive, no URL)
+==============================
+A StickS3 Streams Raw Signal Data; Chrome Draws It Live in 3D
+
+==============================
+PITCH (required -- one short sentence, no URL, doesn't repeat the name)
+==============================
+Bluetooth in, isometric FFT terrain out -- the microcontroller barely does any work.
+
+==============================
+SUGGESTED CATEGORIES (max 3 -- what it achieves, not what it's built with)
+==============================
+Data Visualization, Bluetooth Low Energy, Signal Processing
+
+==============================
+SUGGESTED DIFFICULTY
+==============================
+Intermediate
+
+==============================
+COVER IMAGE
+==============================
+No text overlay, per guidelines. Best option: a full-window screenshot of the live 3D terrain mid-render, right after connecting with a finger on the sensor (or any live signal) -- the teal/amber ridges read well at a glance and it's literally the project's end result, which is what the guidelines ask for. Avoid a photo of the bare board; the terrain IS the payoff here.
+
+==============================
+THINGS USED IN THIS PROJECT
+==============================
+Hardware components:
+- M5Stack StickS3 (x1)
+- PulseSensor, or any analog sensor wired to GPIO2 (x1)
+
+Software:
+- UIFlow2 (v2.4.9) / MicroPython
+- Web Bluetooth (Chrome, desktop)
+
+==============================
+STORY
+==============================
+
+--- Two boxes, one job each ---
+
+Most sensor-to-visualization projects put the interesting logic on the microcontroller and treat the browser as a dumb display. This project does the opposite, deliberately.
+
+The StickS3's entire job: sample a GPIO pin on a steady hardware timer, and relay the raw numbers over Bluetooth LE. It has no idea what the signal means -- no FFT, no filtering, no thresholds. That's not a limitation, it's the point. A microcontroller that only samples and relays can sit in front of any analog sensor and this project doesn't need to change at all.
+
+Chrome's entire job: take that raw stream, run the FFT, and draw a live, orbit-able 3D isometric terrain of the frequency content -- rebuilt about seven times a second. All the compute-heavy work happens on hardware that was sitting idle anyway: the laptop or phone already open in your hand.
+
+--- What it looks like ---
+
+Connect a StickS3 running the relay firmware, and the page immediately starts drawing. Each new analysis becomes one more row of terrain, sliding toward you as older rows scroll back -- height is amplitude, position along the width is frequency, color is a fixed band-by-frequency palette (amber under roughly half a hertz, teal in the 0.7-3.2 Hz range, violet above).
+
+Drag anywhere on the terrain to orbit around it. Scroll to zoom. Click Reset View to snap back to the default angle. That's the entire interface -- one connect button, one 3D view, nothing else competing for attention.
+
+--- Hardware and wiring ---
+
+The sensor plugs straight into the StickS3, no breadboard needed.
+
+  PulseSensor lead -> StickS3 pin
+  Signal (purple)  -> G2 / GPIO2
+  VCC (red)        -> 3V3
+  GND (black)      -> GND
+
+Power the sensor from 3.3V only -- do not connect the red lead to 5V. Disconnect USB power before wiring anything.
+
+Any analog sensor that can sit on GPIO2 and output a signal with real frequency content works here -- the pulse sensor is simply what's on hand.
+
+--- Flashing the stick ---
+
+The verified build runs UIFlow2 v2.4.9 MicroPython. Install mpremote if you don't already have it:
+
+  python3 -m pip install mpremote
+
+Then deploy the relay firmware as the boot program:
+
+  git clone https://github.com/yury-g/StickS3-BLE-Chrome-3D-FFT.git
+  cd StickS3-BLE-Chrome-3D-FFT
+  python3 -m mpremote connect auto fs cp sticks3-relay.py :main.py
+
+[Code block 1 for Hackster's Code section: sticks3-relay.py]
+
+Reset the board. It starts advertising over Bluetooth immediately -- there's no button to press and nothing to configure. If UIFlow2's own launcher opens instead of the relay firmware, set the boot option to run the downloaded program and reset again.
+
+--- Running the page ---
+
+The browser side is a single static HTML file, no build tools and no dependencies:
+
+  python3 -m http.server 8127
+
+Open http://localhost:8127/index.html in desktop Chrome. Web Bluetooth requires a secure context, and localhost satisfies that requirement without needing HTTPS. Click Connect StickS3, choose the device from the browser's picker, and the terrain starts building.
+
+[Code block 2 for Hackster's Code section: index.html]
+
+--- How it talks over Bluetooth ---
+
+The stick advertises a Nordic UART Service and only ever notifies -- the browser never writes anything back to it. Each packet is:
+
+  uint32 first_index   -- absolute index of the first sample in this packet
+  uint16 count         -- how many samples follow
+  uint16 rate_hz       -- the stick's own sampling rate
+  uint32 t_us          -- device timestamp of the first sample
+  ... then count x uint16 little-endian samples
+
+Carrying the absolute sample index means the browser can always tell exactly how many samples were lost on a dropped packet, rather than just guessing from a gap in time.
+
+--- Why the browser, not the microcontroller ---
+
+An ESP32-class chip can run an FFT, but every cycle spent on math is a cycle not spent keeping the sampling timer honest, and the result usually ends up squeezed onto a tiny screen anyway. Handing the math to Chrome means the stick's only real-time obligation is sampling -- which a hardware timer does far more reliably than a software loop juggling DSP and a display at the same time -- and the visualization gets an entire modern GPU-backed canvas to work with instead of a couple square inches of TFT.
+
+--- Where the terrain code came from ---
+
+The 3D rendering here isn't new -- it's a direct port of the terrain visualization from a sibling project, GameEngine (https://github.com/yury-g/PPGFFTGAMEENGINE), which draws the same isometric terrain but reads its signal over USB Serial and layers on PPG-specific interpretation (heart rate, breathing rate, confidence scoring). This project strips all of that back out -- no readouts, no labeled bands claiming physiological meaning, no controls beyond the camera -- and swaps the transport from a USB cable to Bluetooth. The visual result is the same terrain; getting there is much simpler.
+
+For the frequency-analysis side of that same signal -- a real FFT harmonic detector with a confidence score, running over BLE -- see the Pulsewave Harmonics sibling project instead (https://github.com/yury-g/PulsewaveHarmonics). This project draws; that one interprets. Splitting them was deliberate.
+
+--- Limits ---
+
+- One BLE connection at a time -- the stick advertises for a new central the moment the last one disconnects, but it doesn't fan out to several at once.
+- The terrain window holds 68 rows of history; older data simply scrolls off, there's no recording or export built in.
+- This is a visualization, not a medical device, and makes no claims about what any given peak in the terrain means.
+
+==============================
+CREDITS
+==============================
+Terrain visualization ported from PPGFFTGAMEENGINE (https://github.com/yury-g/PPGFFTGAMEENGINE).
+Stick wiring and BLE relay firmware from pulsesensor-m5sticks3 / PulseLink (https://github.com/yury-g/pulsesensor-m5sticks3).
+Sensor hardware: PulseSensor (https://pulsesensor.com).
+
+--
+This draft is also committed in the repo as hackster-tutorial-draft.md. Everything above was tested before it shipped: synthetic BLE data through the real ingest path confirmed the terrain shape, and a real regression (the orbit-drag handler silently swallowing clicks on the Reset View button) was caught and fixed before pushing -- details in the commit history.
