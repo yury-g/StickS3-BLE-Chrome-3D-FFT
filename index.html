@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StickS3 BLE 3D FFT</title>
+<style>
+  :root {
+    --bg: #070b0c;
+    --panel: rgba(255, 255, 255, 0.03);
+    --line: rgba(149, 170, 163, 0.35);
+    --text: #e7f3ef;
+    --muted: #7c8ba1;
+    --teal: #37e8d6;
+    --amber: #ffb23f;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  h1 {
+    font-size: 1rem;
+    margin: 0;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  button {
+    background: #e7f3ef;
+    color: #08110f;
+    border: none;
+    border-radius: 8px;
+    padding: 9px 16px;
+    font-weight: 700;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #status {
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
+  #status.live { color: var(--teal); }
+  #status.warn { color: var(--amber); }
+  #hint {
+    margin-left: auto;
+    font-size: 0.75rem;
+    color: var(--muted);
+  }
+  #stage {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    margin: 0 12px 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    touch-action: none;
+    cursor: grab;
+  }
+  #stage.dragging { cursor: grabbing; }
+  canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  #resetView {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    padding: 6px 10px;
+    font-size: 0.72rem;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>StickS3 &rarr; BLE &rarr; Chrome: live 3D FFT</h1>
+    <button id="connectBtn" type="button">Connect StickS3</button>
+    <span id="status">not connected</span>
+    <span id="hint">drag to orbit &middot; scroll to zoom</span>
+  </header>
+
+  <div id="stage">
+    <canvas id="terrain"></canvas>
+    <button id="resetView" type="button">Reset view</button>
+  </div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Bluetooth transport. Same Nordic UART Service and packet wire format the
+// M5StickS3 firmware (stickS3-relay.py, a copy of pulsewave.py) streams --
+// the stick just samples and relays; every bit of math and all drawing
+// happens here. <uint32 first_index><uint16 count><uint16 rate_hz>
+// <uint32 t_us>, then count x uint16 LE samples.
+// ---------------------------------------------------------------------------
+const BLE_NUS = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const BLE_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+const TICKS_WRAP = 2 ** 30;
+
+const BUF_LEN = 2048;
+const buf = new Float64Array(BUF_LEN);
+let writeIndex = 0;
+let filled = 0;
+let sampleRate = 250;
+let prevTicks = null;
+let ticksOffset = 0;
+let device = null;
+let lastPacketAt = 0;
+
+function pushSample(v) {
+  buf[writeIndex % BUF_LEN] = v;
+  writeIndex += 1;
+  filled = Math.min(filled + 1, BUF_LEN);
+}
+
+function ingestPacket(view) {
+  if (view.byteLength < 12) return;
+  const firstIndex = view.getUint32(0, true);
+  const count = view.getUint16(4, true);
+  const rateHz = view.getUint16(6, true);
+  const ticks = view.getUint32(8, true);
+  if (!count || !rateHz || view.byteLength < 12 + 2 * count) return;
+  if (prevTicks !== null && ticks + ticksOffset < prevTicks) ticksOffset += TICKS_WRAP;
+  prevTicks = ticks + ticksOffset;
+  sampleRate = rateHz;
+  for (let i = 0; i < count; i += 1) pushSample(view.getUint16(12 + 2 * i, true));
+  lastPacketAt = performance.now();
+}
+
+function isLive() { return lastPacketAt && performance.now() - lastPacketAt < 1500; }
+
+function setStatus(text, cls) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = cls || "";
+}
+
+async function connect() {
+  if (!("bluetooth" in navigator)) {
+    setStatus("Web Bluetooth unavailable", "warn");
+    return;
+  }
+  try {
+    setStatus("opening bluetooth", "warn");
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [BLE_NUS] }] });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(BLE_NUS);
+    const tx = await service.getCharacteristic(BLE_TX);
+    await tx.startNotifications();
+    tx.addEventListener("characteristicvaluechanged", (e) => ingestPacket(e.target.value));
+    device.addEventListener("gattserverdisconnected", () => setStatus("disconnected", "warn"));
+    setStatus("streaming", "live");
+    document.getElementById("connectBtn").disabled = true;
+  } catch (err) {
+    setStatus(err?.name === "NotFoundError" ? "canceled" : "connect failed", "warn");
+    console.error(err);
+  }
+}
+document.getElementById("connectBtn").addEventListener("click", connect);
+
+// ---------------------------------------------------------------------------
+// FFT -- the same radix-2 Cooley-Tukey on a Hann-windowed buffer used
+// elsewhere in this family of tools.
+// ---------------------------------------------------------------------------
+const hannCache = new Map();
+function hannWindow(n) {
+  let w = hannCache.get(n);
+  if (w) return w;
+  w = new Float64Array(n);
+  for (let i = 0; i < n; i += 1) w[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1));
+  hannCache.set(n, w);
+  return w;
+}
+function fftRadix2(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i += 1) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cwr = 1, cwi = 0;
+      for (let k = 0; k < len / 2; k += 1) {
+        const ur = re[i + k], ui = im[i + k];
+        const vr = re[i + k + len / 2] * cwr - im[i + k + len / 2] * cwi;
+        const vi = re[i + k + len / 2] * cwi + im[i + k + len / 2] * cwr;
+        re[i + k] = ur + vr; im[i + k] = ui + vi;
+        re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi;
+        const nwr = cwr * wr - cwi * wi;
+        cwi = cwr * wi + cwi * wr;
+        cwr = nwr;
+      }
+    }
+  }
+}
+function orderedSamples(n) {
+  const out = new Float64Array(n);
+  const start = writeIndex - n;
+  for (let i = 0; i < n; i += 1) out[i] = buf[(start + i + BUF_LEN * 4) % BUF_LEN];
+  return out;
+}
+function computeSpectrum() {
+  if (filled < BUF_LEN) return null;
+  const n = BUF_LEN;
+  const samples = orderedSamples(n);
+  const mean = samples.reduce((a, b) => a + b, 0) / n;
+  const win = hannWindow(n);
+  const re = new Float64Array(n);
+  const im = new Float64Array(n);
+  for (let i = 0; i < n; i += 1) re[i] = (samples[i] - mean) * win[i];
+  fftRadix2(re, im);
+  const half = n / 2;
+  const amps = new Float64Array(half);
+  for (let i = 0; i < half; i += 1) amps[i] = Math.hypot(re[i], im[i]);
+  return { amps, binHz: sampleRate / n };
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ---------------------------------------------------------------------------
+// Terrain history: one row per analysis cycle, each row a column of
+// normalized (0-1) FFT amplitudes across [0, MAX_HZ]. Plain FIFO, capped at
+// TERRAIN_ROWS -- no variable-length time window or resampling, unlike the
+// GameEngine sibling project this visual is ported from; that system existed
+// to serve an adjustable time-scale UI control this project doesn't have.
+// ---------------------------------------------------------------------------
+const MAX_HZ = 4;
+const TERRAIN_COLUMNS = 88;
+const TERRAIN_ROWS = 68;
+const terrainHistory = [];
+
+function pushTerrainRow(spectrum) {
+  const { amps, binHz } = spectrum;
+  const maxBin = Math.min(amps.length - 1, Math.floor(MAX_HZ / binHz));
+  let peak = 1e-6;
+  for (let i = 1; i <= maxBin; i += 1) peak = Math.max(peak, amps[i]);
+  const values = new Float64Array(TERRAIN_COLUMNS);
+  for (let col = 0; col < TERRAIN_COLUMNS; col += 1) {
+    const hz = (col / (TERRAIN_COLUMNS - 1)) * MAX_HZ;
+    const bin = clamp(Math.round(hz / binHz), 0, amps.length - 1);
+    values[col] = clamp(amps[bin] / peak, 0, 1);
+  }
+  terrainHistory.push(values);
+  if (terrainHistory.length > TERRAIN_ROWS) terrainHistory.shift();
+}
+
+// ---------------------------------------------------------------------------
+// The 3D isometric terrain render, ported from the GameEngine sibling
+// project's drawTerrain/renderTerrainCache/buildTerrainProjector -- same
+// visual algorithm and color palette, verbatim where it doesn't depend on
+// anything PPG-specific. Physiological markers, labels, and the
+// confidence-driven brightness term are gone; everything else is the same
+// isometric projection and per-frequency-band coloring.
+// ---------------------------------------------------------------------------
+function terrainColor(hz, value) {
+  const alpha = clamp(0.22 + value * 0.72, 0.22, 0.96);
+  if (hz <= 0.62) return `rgba(255, 178, 63, ${alpha})`;
+  if (hz >= 0.7 && hz <= 3.2) return `rgba(55, 232, 214, ${alpha})`;
+  return `rgba(180, 134, 255, ${alpha * 0.5})`;
+}
+
+const view = { yaw: -0.62, pitch: 0.66, zoom: 1.06 };
+const VIEW_DEFAULT = { yaw: -0.62, pitch: 0.66, zoom: 1.06 };
+const drag = { active: false, pointerId: null, startX: 0, startY: 0, startYaw: 0, startPitch: 0 };
+
+function buildTerrainProjector(width, height, rows, cols) {
+  const centerX = width * 0.5;
+  const centerY = height * 0.61;
+  const freqScale = (width / (cols * 1.52)) * view.zoom;
+  const depthScale = ((height * 0.52) / Math.max(20, rows)) * view.zoom;
+  const zScale = height * 0.31 * view.zoom;
+  const yawSin = Math.sin(view.yaw), yawCos = Math.cos(view.yaw);
+  const pitchSin = Math.sin(view.pitch), pitchCos = Math.cos(view.pitch);
+  const depthCenter = (rows - 1) / 2;
+  const columnCenter = (cols - 1) / 2;
+  return {
+    project(column, row, z) {
+      const worldX = (column - columnCenter) * freqScale;
+      const worldDepth = (row - depthCenter) * depthScale;
+      const worldZ = z * zScale;
+      const yawX = worldX * yawCos - worldDepth * yawSin;
+      const yawDepth = worldX * yawSin + worldDepth * yawCos;
+      const perspective = clamp(1 + yawDepth / (height * 5), 0.9, 1.12);
+      return {
+        x: centerX + yawX * perspective,
+        y: centerY + yawDepth * pitchSin - worldZ * pitchCos,
+      };
+    },
+  };
+}
+
+function drawBackdrop(ctx, width, height, now) {
+  const bg = ctx.createLinearGradient(0, 0, 0, height);
+  bg.addColorStop(0, "#070b0c");
+  bg.addColorStop(0.52, "#0d1717");
+  bg.addColorStop(1, "#050708");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(55, 232, 214, 0.08)";
+  ctx.lineWidth = Math.max(1, width * 0.0005);
+  const gridStep = Math.max(28, width / 28);
+  for (let x = (now * 0.018) % gridStep; x < width; x += gridStep) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x - width * 0.15, height); ctx.stroke();
+  }
+  for (let y = height * 0.16; y < height; y += gridStep) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y + width * 0.04); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawTerrain(now) {
+  const canvas = document.getElementById("terrain");
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.round(rect.width * dpr);
+  const height = Math.round(rect.height * dpr);
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, width, height);
+  drawBackdrop(ctx, width, height, now);
+
+  if (terrainHistory.length < 2) {
+    ctx.fillStyle = "#7c8ba1";
+    ctx.font = `${Math.round(width * 0.016)}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.fillText(isLive() ? "filling buffer..." : "connect the stick to begin", width * 0.05, height * 0.5);
+    return;
+  }
+
+  const rows = terrainHistory.length;
+  const cols = TERRAIN_COLUMNS;
+  const terrain = buildTerrainProjector(width, height, rows, cols);
+  const { project } = terrain;
+
+  ctx.save();
+  ctx.shadowColor = "rgba(55, 232, 214, 0.34)";
+  ctx.shadowBlur = Math.max(18, width * 0.025);
+  ctx.fillStyle = "rgba(55, 232, 214, 0.055)";
+  ctx.beginPath();
+  ctx.ellipse(width * 0.52, height * 0.74, width * 0.38, height * 0.16, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  for (let row = 0; row < rows - 1; row += 1) {
+    const current = terrainHistory[row];
+    const next = terrainHistory[row + 1];
+    for (let column = 0; column < cols - 1; column += 1) {
+      const hz = (column / (cols - 1)) * MAX_HZ;
+      const z00 = current[column], z10 = current[column + 1];
+      const z01 = next[column], z11 = next[column + 1];
+      const average = (z00 + z10 + z01 + z11) / 4;
+      const p00 = project(column, row, z00);
+      const p10 = project(column + 1, row, z10);
+      const p11 = project(column + 1, row + 1, z11);
+      const p01 = project(column, row + 1, z01);
+      ctx.beginPath();
+      ctx.moveTo(p00.x, p00.y); ctx.lineTo(p10.x, p10.y);
+      ctx.lineTo(p11.x, p11.y); ctx.lineTo(p01.x, p01.y);
+      ctx.closePath();
+      ctx.fillStyle = terrainColor(hz, average);
+      ctx.fill();
+    }
+  }
+
+  ctx.strokeStyle = "rgba(239, 252, 248, 0.11)";
+  ctx.lineWidth = Math.max(1, width * 0.0008);
+  for (let row = 0; row < rows; row += 6) {
+    ctx.beginPath();
+    for (let column = 0; column < cols; column += 1) {
+      const point = project(column, row, terrainHistory[row][column] * 0.95);
+      if (column === 0) ctx.moveTo(point.x, point.y); else ctx.lineTo(point.x, point.y);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  ctx.fillStyle = "#7c8ba1";
+  ctx.font = `${Math.max(11, Math.round(width * 0.011))}px ui-monospace, Menlo, monospace`;
+  ctx.fillText("0 Hz", width * 0.02, height - 12);
+  ctx.fillText(`${MAX_HZ} Hz`, width - 46, height - 12);
+  ctx.fillText(`${sampleRate.toFixed(0)} Hz sample`, width * 0.02, 20);
+}
+
+// --- Orbit-drag + scroll-zoom camera controls ---
+const stage = document.getElementById("stage");
+stage.addEventListener("pointerdown", (e) => {
+  // Without this, the drag-orbit handler on the parent stage steals every
+  // click meant for a button nested inside it (setPointerCapture below
+  // routes the eventual pointerup to the stage, which can suppress the
+  // synthetic click on the button entirely) -- confirmed by testing: a real
+  // pointerdown->pointerup click on Reset View silently did nothing, while
+  // calling .click() directly worked fine. The GameEngine sibling project's
+  // own drag handler already carried this exact guard.
+  if (e.target.closest("button")) return;
+  drag.active = true;
+  drag.pointerId = e.pointerId;
+  drag.startX = e.clientX; drag.startY = e.clientY;
+  drag.startYaw = view.yaw; drag.startPitch = view.pitch;
+  stage.classList.add("dragging");
+  stage.setPointerCapture?.(e.pointerId);
+});
+stage.addEventListener("pointermove", (e) => {
+  if (!drag.active || e.pointerId !== drag.pointerId) return;
+  const dx = e.clientX - drag.startX, dy = e.clientY - drag.startY;
+  view.yaw = drag.startYaw + dx * 0.006;
+  view.pitch = clamp(drag.startPitch + dy * 0.0045, 0.22, 1.34);
+});
+function endDrag(e) {
+  if (drag.pointerId !== null && e.pointerId !== drag.pointerId) return;
+  drag.active = false; drag.pointerId = null;
+  stage.classList.remove("dragging");
+}
+stage.addEventListener("pointerup", endDrag);
+stage.addEventListener("pointercancel", endDrag);
+stage.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  view.zoom = clamp(view.zoom * (e.deltaY > 0 ? 0.94 : 1.06), 0.72, 1.38);
+}, { passive: false });
+document.getElementById("resetView").addEventListener("click", () => {
+  view.yaw = VIEW_DEFAULT.yaw; view.pitch = VIEW_DEFAULT.pitch; view.zoom = VIEW_DEFAULT.zoom;
+});
+
+// ---------------------------------------------------------------------------
+// Main loop: a fresh FFT roughly every 150 ms becomes one new terrain row.
+// ---------------------------------------------------------------------------
+let lastAnalysisAt = 0;
+function frame(now) {
+  if (now - lastAnalysisAt >= 150) {
+    lastAnalysisAt = now;
+    const spectrum = computeSpectrum();
+    if (spectrum) pushTerrainRow(spectrum);
+  }
+  drawTerrain(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
