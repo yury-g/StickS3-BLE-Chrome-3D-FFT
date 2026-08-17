@@ -1,3 +1,5 @@
+> **Personal independent demo by Yury Gitman.** This repository is not official World Famous Electronics or PulseSensor documentation and does not define current product compatibility or support policy. Current WFE information lives under [`WorldFamousElectronics`](https://github.com/WorldFamousElectronics).
+
 # StickS3 &rarr; BLE &rarr; Chrome: Live 3D FFT
 
 A minimal, modular demo: an M5Stack StickS3 samples a signal and relays it
